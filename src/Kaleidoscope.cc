@@ -47,8 +47,8 @@ enum class Token_t {
 };
 
 std::string g_identifier_string;
-double g_number_val;
-Token_t g_current_token_type;
+double      g_number_val;
+Token_t     g_current_token_type;
 
 const std::map<char, Token_t> g_char_token = {{'(', Token_t::LEFT_PAREN}, {')', Token_t::RIGHT_PAREM}, {',', Token_t::COMMA},
                                               {'+', Token_t::ADD},        {'-', Token_t::SUB},         {'*', Token_t::MUL},
@@ -60,9 +60,10 @@ const std::map<std::string, Token_t> g_keyword_token = {
 const std::map<Token_t, int> g_binop_precedence = {{Token_t::LESS_THAN, 10}, {Token_t::GREAT_THAN, 10}, {Token_t::ADD, 20},
                                                    {Token_t::SUB, 20},       {Token_t::MUL, 30},        {Token_t::DIV, 30}};
 
-llvm::LLVMContext g_llvm_context;
-llvm::IRBuilder<> g_ir_builder(g_llvm_context);
-llvm::Module g_module("Kaleidoscope", g_llvm_context);
+llvm::LLVMContext                   g_llvm_context;
+llvm::IRBuilder<>                   g_ir_builder(g_llvm_context);
+llvm::Module                        g_module("Kaleidoscope", g_llvm_context);
+llvm::legacy::FunctionPassManager   g_fpm(&g_module);
 std::map<std::string, llvm::Value*> g_named_values;
 
 Token_t GetToken() {
@@ -73,8 +74,8 @@ Token_t GetToken() {
 
     if (g_char_token.find(last_char) != g_char_token.end()) {
         const char saved_last_char = last_char;
-        g_identifier_string = saved_last_char;
-        last_char = getchar();
+        g_identifier_string        = saved_last_char;
+        last_char                  = getchar();
         return g_char_token.at(saved_last_char);
     }
 
@@ -126,7 +127,7 @@ Token_t GetNextToken() {
 
 class ExprAST {
 public:
-    virtual ~ExprAST() = default;
+    virtual ~ExprAST()             = default;
     virtual llvm::Value* CodeGen() = 0;
 };
 
@@ -158,7 +159,7 @@ public:
 
 class BinaryExprAST : public ExprAST {
 private:
-    Token_t m_op;
+    Token_t                  m_op;
     std::unique_ptr<ExprAST> m_lhs;
     std::unique_ptr<ExprAST> m_rhs;
 
@@ -194,7 +195,7 @@ public:
 
 class CallExprAST : public ExprAST {
 private:
-    std::string m_callee;
+    std::string                           m_callee;
     std::vector<std::unique_ptr<ExprAST>> m_args;
 
 public:
@@ -203,18 +204,18 @@ public:
         , m_args(std::move(args)) {
     }
     llvm::Value* CodeGen() override {
-        llvm::Function* callee = g_module.getFunction(m_callee);
+        llvm::Function*           callee = g_module.getFunction(m_callee);
         std::vector<llvm::Value*> args;
         for (auto& arg_expr : m_args) {
             args.push_back(arg_expr->CodeGen());
         }
-        return g_ir_builder.CreateCall(callee, args, "calleetmp");
+        return g_ir_builder.CreateCall(callee, args, std::string("__calleetmp_" + m_callee + "__").c_str());
     }
 };
 
 class PrototypeAST {
 private:
-    std::string m_name;
+    std::string              m_name;
     std::vector<std::string> m_args;
 
 public:
@@ -233,10 +234,10 @@ public:
     }
 
     llvm::Function* CodeGen() {
-        std::vector<llvm::Type*> doubles(m_args.size(), llvm::Type::getDoubleTy(g_llvm_context));
-        llvm::FunctionType* function_type = llvm::FunctionType::get(llvm::Type::getDoubleTy(g_llvm_context), doubles, false);
-        llvm::Function* func = llvm::Function::Create(function_type, llvm::Function::ExternalLinkage, m_name, &g_module);
-        int index = 0;
+        std::vector<llvm::Type*> double_type_args(m_args.size(), llvm::Type::getDoubleTy(g_llvm_context));
+        llvm::FunctionType*      function_type = llvm::FunctionType::get(llvm::Type::getDoubleTy(g_llvm_context), double_type_args, false);
+        llvm::Function*          func          = llvm::Function::Create(function_type, llvm::Function::ExternalLinkage, m_name, &g_module);
+        int                      index         = 0;
         for (auto& arg : func->args()) {
             arg.setName(m_args[index++]);
         }
@@ -247,7 +248,7 @@ public:
 class FunctionAST {
 private:
     std::unique_ptr<PrototypeAST> m_proto;
-    std::unique_ptr<ExprAST> m_body;
+    std::unique_ptr<ExprAST>      m_body;
 
 public:
     FunctionAST(std::unique_ptr<PrototypeAST>& proto, std::unique_ptr<ExprAST>& body)
@@ -262,15 +263,16 @@ public:
         }
         llvm::BasicBlock* block = llvm::BasicBlock::Create(g_llvm_context, "entry", func);
         g_ir_builder.SetInsertPoint(block);
+        // 预设了 Kaleidoscope 的 VariableExpr 只存在于函数内对函数参数的引用
         g_named_values.clear();
         for (llvm::Value& arg : func->args()) {
-            // g_named_values[arg.getName()] = &arg;
             g_named_values.emplace(arg.getName(), &arg);
         }
 
         llvm::Value* ret_val = m_body->CodeGen();
         g_ir_builder.CreateRet(ret_val);
         llvm::verifyFunction(*func);
+        g_fpm.run(*func);
         return func;
     }
 };
@@ -388,7 +390,7 @@ std::unique_ptr<PrototypeAST> ParsePrototype() {
 std::unique_ptr<FunctionAST> ParseDefinition() {
     GetNextToken();
     auto proto = ParsePrototype();
-    auto expr = ParseExpression();
+    auto expr  = ParseExpression();
     return std::make_unique<FunctionAST>(proto, expr);
 }
 
@@ -400,12 +402,18 @@ std::unique_ptr<PrototypeAST> ParseExtern() {
 
 // toplevelexpr ::= expression
 std::unique_ptr<FunctionAST> ParseTopLevelExpr() {
-    auto expr = ParseExpression();
+    auto expr  = ParseExpression();
     auto proto = std::make_unique<PrototypeAST>("__anonymous_expr__", std::vector<std::string>{});
     return std::make_unique<FunctionAST>(proto, expr);
 }
 
 int main() {
+    g_fpm.add(llvm::createInstructionCombiningPass());
+    g_fpm.add(llvm::createReassociatePass());
+    g_fpm.add(llvm::createGVNPass());
+    g_fpm.add(llvm::createCFGSimplificationPass());
+    g_fpm.doInitialization();
+
     while (true) {
         std::cout << "\033[31mReady > \033[0m";
         GetNextToken();
@@ -438,7 +446,7 @@ int main() {
                 break;
             }
         }
-        g_identifier_string = "";
+        g_identifier_string  = "";
         g_current_token_type = Token_t::END_OF_FILE;
     }
     return 0;

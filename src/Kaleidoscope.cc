@@ -1,3 +1,4 @@
+#include "KaleidoscopeJIT.h"
 #include <llvm/ADT/APFloat.h>
 #include <llvm/ADT/STLExtras.h>
 #include <llvm/IR/BasicBlock.h>
@@ -46,9 +47,10 @@ enum class Token_t {
     UNKNOWN
 };
 
-std::string g_identifier_string;
-double      g_number_val;
-Token_t     g_current_token_type;
+std::string                         g_identifier_string;
+double                              g_number_val;
+Token_t                             g_current_token_type;
+std::map<std::string, llvm::Value*> g_named_values;
 
 const std::map<char, Token_t> g_char_token = {{'(', Token_t::LEFT_PAREN}, {')', Token_t::RIGHT_PAREM}, {',', Token_t::COMMA},
                                               {'+', Token_t::ADD},        {'-', Token_t::SUB},         {'*', Token_t::MUL},
@@ -60,11 +62,12 @@ const std::map<std::string, Token_t> g_keyword_token = {
 const std::map<Token_t, int> g_binop_precedence = {{Token_t::LESS_THAN, 10}, {Token_t::GREAT_THAN, 10}, {Token_t::ADD, 20},
                                                    {Token_t::SUB, 20},       {Token_t::MUL, 30},        {Token_t::DIV, 30}};
 
-llvm::LLVMContext                   g_llvm_context;
-llvm::IRBuilder<>                   g_ir_builder(g_llvm_context);
-llvm::Module                        g_module("Kaleidoscope", g_llvm_context);
-llvm::legacy::FunctionPassManager   g_fpm(&g_module);
-std::map<std::string, llvm::Value*> g_named_values;
+static llvm::ExitOnError                                  ExitOnErr;
+static std::unique_ptr<llvm::LLVMContext>                 g_llvm_context;
+static std::unique_ptr<llvm::IRBuilder<>>                 g_ir_builder;
+static std::unique_ptr<llvm::Module>                      g_module;
+static std::unique_ptr<llvm::legacy::FunctionPassManager> g_fpm;
+static std::unique_ptr<llvm::orc::KaleidoscopeJIT>        g_jit;
 
 Token_t GetToken() {
     static char last_char = ' ';
@@ -140,7 +143,7 @@ public:
         : m_val(val) {
     }
     llvm::Value* CodeGen() override {
-        return llvm::ConstantFP::get(g_llvm_context, llvm::APFloat(m_val));
+        return llvm::ConstantFP::get(*g_llvm_context, llvm::APFloat(m_val));
     }
 };
 
@@ -175,16 +178,16 @@ public:
         llvm::Value* rhs = m_rhs->CodeGen();
         switch (m_op) {
             case Token_t::ADD:
-                return g_ir_builder.CreateFAdd(lhs, rhs, "addtmp");
+                return g_ir_builder->CreateFAdd(lhs, rhs, "addtmp");
             case Token_t::SUB:
-                return g_ir_builder.CreateFSub(lhs, rhs, "subtmp");
+                return g_ir_builder->CreateFSub(lhs, rhs, "subtmp");
             case Token_t::MUL:
-                return g_ir_builder.CreateFMul(lhs, rhs, "multmp");
+                return g_ir_builder->CreateFMul(lhs, rhs, "multmp");
             case Token_t::DIV:
-                return g_ir_builder.CreateFDiv(lhs, rhs, "divtmp");
+                return g_ir_builder->CreateFDiv(lhs, rhs, "divtmp");
             case Token_t::LESS_THAN: {
-                llvm::Value* tmp = g_ir_builder.CreateFCmpULT(lhs, rhs, "cmptmp");
-                return g_ir_builder.CreateUIToFP(tmp, llvm::Type::getDoubleTy(g_llvm_context), "booltmp");
+                llvm::Value* tmp = g_ir_builder->CreateFCmpULT(lhs, rhs, "cmptmp");
+                return g_ir_builder->CreateUIToFP(tmp, llvm::Type::getDoubleTy(*g_llvm_context), "booltmp");
             }
             default:
                 break;
@@ -204,12 +207,12 @@ public:
         , m_args(std::move(args)) {
     }
     llvm::Value* CodeGen() override {
-        llvm::Function*           callee = g_module.getFunction(m_callee);
+        llvm::Function*           callee = g_module->getFunction(m_callee);
         std::vector<llvm::Value*> args;
         for (auto& arg_expr : m_args) {
             args.push_back(arg_expr->CodeGen());
         }
-        return g_ir_builder.CreateCall(callee, args, std::string("__calleetmp_" + m_callee + "__").c_str());
+        return g_ir_builder->CreateCall(callee, args, std::string("__calleetmp_" + m_callee + "__").c_str());
     }
 };
 
@@ -234,10 +237,10 @@ public:
     }
 
     llvm::Function* CodeGen() {
-        std::vector<llvm::Type*> double_type_args(m_args.size(), llvm::Type::getDoubleTy(g_llvm_context));
-        llvm::FunctionType*      function_type = llvm::FunctionType::get(llvm::Type::getDoubleTy(g_llvm_context), double_type_args, false);
-        llvm::Function*          func          = llvm::Function::Create(function_type, llvm::Function::ExternalLinkage, m_name, &g_module);
-        int                      index         = 0;
+        std::vector<llvm::Type*> double_type_args(m_args.size(), llvm::Type::getDoubleTy(*g_llvm_context));
+        llvm::FunctionType*      function_type = llvm::FunctionType::get(llvm::Type::getDoubleTy(*g_llvm_context), double_type_args, false);
+        llvm::Function*          func  = llvm::Function::Create(function_type, llvm::Function::ExternalLinkage, m_name, g_module.get());
+        int                      index = 0;
         for (auto& arg : func->args()) {
             arg.setName(m_args[index++]);
         }
@@ -257,12 +260,12 @@ public:
     }
 
     llvm::Value* CodeGen() {
-        llvm::Function* func = g_module.getFunction(m_proto->GetName());
+        llvm::Function* func = g_module->getFunction(m_proto->GetName());
         if (nullptr == func) {
             func = m_proto->CodeGen();
         }
-        llvm::BasicBlock* block = llvm::BasicBlock::Create(g_llvm_context, "entry", func);
-        g_ir_builder.SetInsertPoint(block);
+        llvm::BasicBlock* block = llvm::BasicBlock::Create(*g_llvm_context, "entry", func);
+        g_ir_builder->SetInsertPoint(block);
         // 预设了 Kaleidoscope 的 VariableExpr 只存在于函数内对函数参数的引用
         g_named_values.clear();
         for (llvm::Value& arg : func->args()) {
@@ -270,9 +273,9 @@ public:
         }
 
         llvm::Value* ret_val = m_body->CodeGen();
-        g_ir_builder.CreateRet(ret_val);
+        g_ir_builder->CreateRet(ret_val);
         llvm::verifyFunction(*func);
-        g_fpm.run(*func);
+        g_fpm->run(*func);
         return func;
     }
 };
@@ -407,19 +410,43 @@ std::unique_ptr<FunctionAST> ParseTopLevelExpr() {
     return std::make_unique<FunctionAST>(proto, expr);
 }
 
-int main() {
-    g_fpm.add(llvm::createInstructionCombiningPass());
-    g_fpm.add(llvm::createReassociatePass());
-    g_fpm.add(llvm::createGVNPass());
-    g_fpm.add(llvm::createCFGSimplificationPass());
-    g_fpm.doInitialization();
+static void InitializeModule() {
+    g_llvm_context = std::make_unique<llvm::LLVMContext>();
+    g_module       = std::make_unique<llvm::Module>("Kaleidoscope JIT", *g_llvm_context);
+    g_module->setDataLayout(g_jit->getDataLayout());
+    g_ir_builder = std::make_unique<llvm::IRBuilder<>>(*g_llvm_context);
 
+    g_fpm = std::make_unique<llvm::legacy::FunctionPassManager>(g_module.get());
+    g_fpm->add(llvm::createInstructionCombiningPass());
+    g_fpm->add(llvm::createReassociatePass());
+    g_fpm->add(llvm::createGVNPass());
+    g_fpm->add(llvm::createCFGSimplificationPass());
+    g_fpm->doInitialization();
+}
+
+static void HandleTopLevelExpression() {
+    auto ptle_ast = ParseTopLevelExpr();
+    std::cout << "parsed a top level expr" << std::endl;
+    ptle_ast->CodeGen()->print(llvm::errs());
+    std::cout << std::endl;
+
+    auto resource_tracker = g_jit->getMainJITDylib().createResourceTracker();
+    auto tsm              = llvm::orc::ThreadSafeModule(std::move(g_module), std::move(g_llvm_context));
+    ExitOnErr(g_jit->addModule(std::move(tsm), resource_tracker));
+    InitializeModule();
+    auto symbol    = ExitOnErr(g_jit->lookup("__anonymous_expr__"));
+    double (*fp)() = (double (*)())(symbol.getAddress());
+    std::cout << "JIT evaluated to: " << fp() << std::endl;
+    ExitOnErr(resource_tracker->remove());
+}
+
+static void MainLoop() {
     while (true) {
         std::cout << "\033[31mReady > \033[0m";
         GetNextToken();
         switch (g_current_token_type) {
             case Token_t::END_OF_FILE:
-                return 0;
+                return;
             case Token_t::DEF: {
                 auto pd_ast = ParseDefinition();
                 std::cout << "parsed a function definition" << std::endl;
@@ -439,15 +466,22 @@ int main() {
                 break;
             }
             default: {
-                auto ptle_ast = ParseTopLevelExpr();
-                std::cout << "parsed a top level expr" << std::endl;
-                ptle_ast->CodeGen()->print(llvm::errs());
-                std::cerr << std::endl;
+                HandleTopLevelExpression();
                 break;
             }
         }
         g_identifier_string  = "";
         g_current_token_type = Token_t::END_OF_FILE;
     }
+}
+
+int main() {
+    llvm::InitializeNativeTarget();
+    llvm::InitializeNativeTargetAsmPrinter();
+    llvm::InitializeNativeTargetAsmParser();
+    g_jit = ExitOnErr(llvm::orc::KaleidoscopeJIT::Create());
+    InitializeModule();
+
+    MainLoop();
     return 0;
 }

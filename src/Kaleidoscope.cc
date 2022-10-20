@@ -1,4 +1,6 @@
 #include "KaleidoscopeJIT.h"
+#include "llvm/Support/raw_ostream.h"
+#include <cstdint>
 #include <llvm/ADT/APFloat.h>
 #include <llvm/ADT/STLExtras.h>
 #include <llvm/IR/BasicBlock.h>
@@ -156,6 +158,9 @@ public:
         : m_name(name) {
     }
     llvm::Value* CodeGen() override {
+        if (g_named_values.find(m_name) == g_named_values.end()) {
+            return nullptr;
+        }
         return g_named_values.at(m_name);
     }
 };
@@ -187,7 +192,11 @@ public:
                 return g_ir_builder->CreateFDiv(lhs, rhs, "divtmp");
             case Token_t::LESS_THAN: {
                 llvm::Value* tmp = g_ir_builder->CreateFCmpULT(lhs, rhs, "cmptmp");
-                return g_ir_builder->CreateUIToFP(tmp, llvm::Type::getDoubleTy(*g_llvm_context), "booltmp");
+                return g_ir_builder->CreateUIToFP(tmp, llvm::Type::getDoubleTy(*g_llvm_context), "bool_less_than");
+            }
+            case Token_t::GREAT_THAN: {
+                llvm::Value* tmp = g_ir_builder->CreateFCmpULT(rhs, lhs, "cmptmp");
+                return g_ir_builder->CreateUIToFP(tmp, llvm::Type::getDoubleTy(*g_llvm_context), "bool_great_than");
             }
             default:
                 break;
@@ -202,17 +211,68 @@ private:
     std::vector<std::unique_ptr<ExprAST>> m_args;
 
 public:
+    // TODO: 这里是不是右值传过去
     CallExprAST(std::string&& callee, std::vector<std::unique_ptr<ExprAST>>&& args)
         : m_callee(std::move(callee))
         , m_args(std::move(args)) {
     }
     llvm::Value* CodeGen() override {
-        llvm::Function*           callee = g_module->getFunction(m_callee);
-        std::vector<llvm::Value*> args;
-        for (auto& arg_expr : m_args) {
-            args.push_back(arg_expr->CodeGen());
+        // std::cout << __func__ << " m_callee:" << m_callee << std::endl;
+        llvm::Function* callee = g_module->getFunction(m_callee);
+        if (callee) {
+            std::vector<llvm::Value*> args;
+            for (auto& arg_expr : m_args) {
+                args.push_back(arg_expr->CodeGen());
+            }
+            return g_ir_builder->CreateCall(callee, args, std::string("__calleetmp_" + m_callee + "__").c_str());
         }
-        return g_ir_builder->CreateCall(callee, args, std::string("__calleetmp_" + m_callee + "__").c_str());
+        fprintf(stderr, "Unknown function referenced");
+        return nullptr;
+    }
+};
+
+class IfExprAST : public ExprAST {
+private:
+    std::unique_ptr<ExprAST> m_cond;
+    std::unique_ptr<ExprAST> m_then_expr;
+    std::unique_ptr<ExprAST> m_else_expr;
+
+public:
+    IfExprAST(std::unique_ptr<ExprAST> cond, std::unique_ptr<ExprAST> then_expr, std::unique_ptr<ExprAST> else_expr)
+        : m_cond(std::move(cond))
+        , m_then_expr(std::move(then_expr))
+        , m_else_expr(std::move(else_expr)) {
+    }
+
+    llvm::Value* CodeGen() override {
+        llvm::Value* cond_val = m_cond->CodeGen();
+        cond_val              = g_ir_builder->CreateFCmpONE(cond_val, llvm::ConstantFP::get(*g_llvm_context, llvm::APFloat(0.0)), "ifcond");
+
+        llvm::Function*   func        = g_ir_builder->GetInsertBlock()->getParent();
+        llvm::BasicBlock* then_block  = llvm::BasicBlock::Create(*g_llvm_context, "then", func);
+        llvm::BasicBlock* else_block  = llvm::BasicBlock::Create(*g_llvm_context, "else");
+        llvm::BasicBlock* final_block = llvm::BasicBlock::Create(*g_llvm_context, "ifcont");
+
+        g_ir_builder->CreateCondBr(cond_val, then_block, else_block);
+
+        g_ir_builder->SetInsertPoint(then_block);
+        llvm::Value* then_val = m_then_expr->CodeGen();
+        g_ir_builder->CreateBr(final_block);
+        then_block = g_ir_builder->GetInsertBlock();
+
+        func->getBasicBlockList().push_back(else_block);
+        g_ir_builder->SetInsertPoint(else_block);
+        llvm::Value* else_val = m_else_expr->CodeGen();
+        g_ir_builder->CreateBr(final_block);
+        else_block = g_ir_builder->GetInsertBlock();
+
+        func->getBasicBlockList().push_back(final_block);
+        g_ir_builder->SetInsertPoint(final_block);
+
+        llvm::PHINode* pn = g_ir_builder->CreatePHI(llvm::Type::getDoubleTy(*g_llvm_context), 2, "iftmp");
+        pn->addIncoming(then_val, then_block);
+        pn->addIncoming(else_val, else_block);
+        return pn;
     }
 };
 
@@ -273,6 +333,11 @@ public:
         }
 
         llvm::Value* ret_val = m_body->CodeGen();
+        if (!ret_val) {
+            func->eraseFromParent();
+            return nullptr;
+        }
+
         g_ir_builder->CreateRet(ret_val);
         llvm::verifyFunction(*func);
         g_fpm->run(*func);
@@ -322,6 +387,16 @@ std::unique_ptr<ExprAST> ParseIdentifierExpr() {
     return std::make_unique<CallExprAST>(std::move(id), std::move(args));
 }
 
+std::unique_ptr<ExprAST> ParseIfExpr() {
+    GetNextToken();
+    std::unique_ptr<ExprAST> cond = ParseExpression();
+    GetNextToken();
+    std::unique_ptr<ExprAST> then_expr = ParseExpression();
+    GetNextToken();
+    std::unique_ptr<ExprAST> else_expr = ParseExpression();
+    return std::make_unique<IfExprAST>(std::move(cond), std::move(then_expr), std::move(else_expr));
+}
+
 // primary
 //   ::= identifierexpr
 //   ::= numberexpr
@@ -334,6 +409,8 @@ std::unique_ptr<ExprAST> ParsePrimary() {
             return ParseNumberExpr();
         case Token_t::LEFT_PAREN:
             return ParseParenExpr();
+        case Token_t::IF:
+            return ParseIfExpr();
         default:
             break;
     }
@@ -405,15 +482,17 @@ std::unique_ptr<PrototypeAST> ParseExtern() {
 
 // toplevelexpr ::= expression
 std::unique_ptr<FunctionAST> ParseTopLevelExpr() {
-    auto expr  = ParseExpression();
     auto proto = std::make_unique<PrototypeAST>("__anonymous_expr__", std::vector<std::string>{});
+    auto expr  = ParseExpression();
     return std::make_unique<FunctionAST>(proto, expr);
 }
 
 static void InitializeModule() {
     g_llvm_context = std::make_unique<llvm::LLVMContext>();
     g_module       = std::make_unique<llvm::Module>("Kaleidoscope JIT", *g_llvm_context);
+#ifdef USE_JIT
     g_module->setDataLayout(g_jit->getDataLayout());
+#endif
     g_ir_builder = std::make_unique<llvm::IRBuilder<>>(*g_llvm_context);
 
     g_fpm = std::make_unique<llvm::legacy::FunctionPassManager>(g_module.get());
@@ -427,17 +506,26 @@ static void InitializeModule() {
 static void HandleTopLevelExpression() {
     auto ptle_ast = ParseTopLevelExpr();
     std::cout << "parsed a top level expr" << std::endl;
-    ptle_ast->CodeGen()->print(llvm::errs());
-    std::cout << std::endl;
-
-    auto resource_tracker = g_jit->getMainJITDylib().createResourceTracker();
-    auto tsm              = llvm::orc::ThreadSafeModule(std::move(g_module), std::move(g_llvm_context));
-    ExitOnErr(g_jit->addModule(std::move(tsm), resource_tracker));
-    InitializeModule();
-    auto symbol    = ExitOnErr(g_jit->lookup("__anonymous_expr__"));
-    double (*fp)() = (double (*)())(symbol.getAddress());
-    std::cout << "JIT evaluated to: " << fp() << std::endl;
-    ExitOnErr(resource_tracker->remove());
+    auto ptle_ast_code = ptle_ast->CodeGen();
+    if (ptle_ast_code) {
+        ptle_ast_code->print(llvm::outs());
+#ifdef USE_JIT
+        auto resource_tracker = g_jit->getMainJITDylib().createResourceTracker();
+        auto tsm              = llvm::orc::ThreadSafeModule(std::move(g_module), std::move(g_llvm_context));
+        ExitOnErr(g_jit->addModule(std::move(tsm), resource_tracker));
+        InitializeModule();
+        auto symbol    = ExitOnErr(g_jit->lookup("__anonymous_expr__"));
+        double (*fp)() = reinterpret_cast<double (*)()>(symbol.getAddress());
+        std::cout << "JIT evaluated to: " << fp() << std::endl;
+        ExitOnErr(resource_tracker->remove());
+#else
+        // 解决非JIT模式下匿名函数覆盖问题
+        static_cast<llvm::Function*>(ptle_ast_code)->eraseFromParent();
+#endif
+    } else {
+        // GetNextToken();
+        std::cout << "parse top level expr failed" << std::endl;
+    }
 }
 
 static void MainLoop() {
@@ -450,14 +538,16 @@ static void MainLoop() {
             case Token_t::DEF: {
                 auto pd_ast = ParseDefinition();
                 std::cout << "parsed a function definition" << std::endl;
-                pd_ast->CodeGen()->print(llvm::errs());
+                pd_ast->CodeGen()->print(llvm::outs());
                 std::cerr << std::endl;
+                // ExitOnErr(g_jit->addModule(llvm::orc::ThreadSafeModule(std::move(g_module), std::move(g_llvm_context))));
+                // InitializeModule();
                 break;
             }
             case Token_t::EXTERN: {
                 auto pe_ast = ParseExtern();
                 std::cout << "parsed a extern" << std::endl;
-                pe_ast->CodeGen()->print(llvm::errs());
+                pe_ast->CodeGen()->print(llvm::outs());
                 std::cerr << std::endl;
                 break;
             }
@@ -479,7 +569,10 @@ int main() {
     llvm::InitializeNativeTarget();
     llvm::InitializeNativeTargetAsmPrinter();
     llvm::InitializeNativeTargetAsmParser();
+#ifdef USE_JIT
     g_jit = ExitOnErr(llvm::orc::KaleidoscopeJIT::Create());
+    std::cout << "JIT created" << std::endl;
+#endif
     InitializeModule();
 
     MainLoop();

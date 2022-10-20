@@ -1,6 +1,7 @@
 #include "KaleidoscopeJIT.h"
 #include "llvm/Support/raw_ostream.h"
 #include <cstdint>
+#include <cstdio>
 #include <llvm/ADT/APFloat.h>
 #include <llvm/ADT/STLExtras.h>
 #include <llvm/IR/BasicBlock.h>
@@ -64,7 +65,9 @@ const std::map<std::string, Token_t> g_keyword_token = {
 const std::map<Token_t, int> g_binop_precedence = {{Token_t::LESS_THAN, 10}, {Token_t::GREAT_THAN, 10}, {Token_t::ADD, 20},
                                                    {Token_t::SUB, 20},       {Token_t::MUL, 30},        {Token_t::DIV, 30}};
 
-static llvm::ExitOnError                                  ExitOnErr;
+static llvm::ExitOnError ExitOnErr;
+llvm::Function*          GetFunction(const std::string& func_name);
+
 static std::unique_ptr<llvm::LLVMContext>                 g_llvm_context;
 static std::unique_ptr<llvm::IRBuilder<>>                 g_ir_builder;
 static std::unique_ptr<llvm::Module>                      g_module;
@@ -218,16 +221,22 @@ public:
     }
     llvm::Value* CodeGen() override {
         // std::cout << __func__ << " m_callee:" << m_callee << std::endl;
-        llvm::Function* callee = g_module->getFunction(m_callee);
-        if (callee) {
-            std::vector<llvm::Value*> args;
-            for (auto& arg_expr : m_args) {
-                args.push_back(arg_expr->CodeGen());
-            }
-            return g_ir_builder->CreateCall(callee, args, std::string("__calleetmp_" + m_callee + "__").c_str());
+        auto callee = GetFunction(m_callee);
+        if (nullptr == callee) {
+            fprintf(stderr, "Unknown function referenced");
+            return nullptr;
         }
-        fprintf(stderr, "Unknown function referenced");
-        return nullptr;
+
+        if (callee->arg_size() != m_args.size()) {
+            fprintf(stderr, "Incorrect # arguments passed");
+            return nullptr;
+        }
+
+        std::vector<llvm::Value*> args;
+        for (auto& arg_expr : m_args) {
+            args.push_back(arg_expr->CodeGen());
+        }
+        return g_ir_builder->CreateCall(callee, args, std::string("__calleetmp_" + m_callee + "__").c_str());
     }
 };
 
@@ -308,6 +317,8 @@ public:
     }
 };
 
+static std::map<std::string, std::unique_ptr<PrototypeAST>> g_function_protos;
+
 class FunctionAST {
 private:
     std::unique_ptr<PrototypeAST> m_proto;
@@ -320,10 +331,14 @@ public:
     }
 
     llvm::Value* CodeGen() {
-        llvm::Function* func = g_module->getFunction(m_proto->GetName());
+        auto& cur_proto = *m_proto;
+        g_function_protos.emplace(cur_proto.GetName(), std::move(m_proto));
+        llvm::Function* func = GetFunction(cur_proto.GetName());
         if (nullptr == func) {
-            func = m_proto->CodeGen();
+            fprintf(stderr, "Unknown function referenced");
+            return nullptr;
         }
+
         llvm::BasicBlock* block = llvm::BasicBlock::Create(*g_llvm_context, "entry", func);
         g_ir_builder->SetInsertPoint(block);
         // 预设了 Kaleidoscope 的 VariableExpr 只存在于函数内对函数参数的引用
@@ -333,17 +348,29 @@ public:
         }
 
         llvm::Value* ret_val = m_body->CodeGen();
-        if (!ret_val) {
-            func->eraseFromParent();
-            return nullptr;
+        if (ret_val) {
+            g_ir_builder->CreateRet(ret_val);
+            llvm::verifyFunction(*func);
+            g_fpm->run(*func);
+            return func;
         }
 
-        g_ir_builder->CreateRet(ret_val);
-        llvm::verifyFunction(*func);
-        g_fpm->run(*func);
-        return func;
+        func->eraseFromParent();
+        return nullptr;
     }
 };
+
+llvm::Function* GetFunction(const std::string& func_name) {
+    auto func = g_module->getFunction(func_name);
+    if (func) {
+        return func;
+    }
+    auto func_iterator = g_function_protos.find(func_name);
+    if (func_iterator != g_function_protos.end()) {
+        return func_iterator->second->CodeGen();
+    }
+    return nullptr;
+}
 
 std::unique_ptr<ExprAST> ParseNumberExpr() {
     auto res = std::make_unique<NumberExprAST>(g_number_val);
@@ -510,6 +537,8 @@ static void HandleTopLevelExpression() {
     if (ptle_ast_code) {
         ptle_ast_code->print(llvm::outs());
 #ifdef USE_JIT
+        // Create a ResourceTracker to track JIT's memory allocated to our
+        // anonymous expression -- that way we can free it after executing.
         auto resource_tracker = g_jit->getMainJITDylib().createResourceTracker();
         auto tsm              = llvm::orc::ThreadSafeModule(std::move(g_module), std::move(g_llvm_context));
         ExitOnErr(g_jit->addModule(std::move(tsm), resource_tracker));
@@ -539,16 +568,21 @@ static void MainLoop() {
                 auto pd_ast = ParseDefinition();
                 std::cout << "parsed a function definition" << std::endl;
                 pd_ast->CodeGen()->print(llvm::outs());
-                std::cerr << std::endl;
-                // ExitOnErr(g_jit->addModule(llvm::orc::ThreadSafeModule(std::move(g_module), std::move(g_llvm_context))));
-                // InitializeModule();
+                std::cout << std::endl;
+#ifdef USE_JIT
+                // 定义的函数注册至 JIT，并注册新的模块与优化器
+                // 否则在 JIT 模式下第二次调用函数会出现未定义的错误
+                ExitOnErr(g_jit->addModule(llvm::orc::ThreadSafeModule(std::move(g_module), std::move(g_llvm_context))));
+                InitializeModule();
+#endif
                 break;
             }
             case Token_t::EXTERN: {
                 auto pe_ast = ParseExtern();
                 std::cout << "parsed a extern" << std::endl;
                 pe_ast->CodeGen()->print(llvm::outs());
-                std::cerr << std::endl;
+                std::cout << std::endl;
+                g_function_protos.emplace(pe_ast->GetName(), std::move(pe_ast));
                 break;
             }
             case Token_t::ASIIC: {

@@ -33,6 +33,8 @@ enum class Token_t {
     IF,
     THEN,
     ELSE,
+    FOR,
+    INCR,
     DEF,
     EXTERN,
     IDENTIFIER,
@@ -46,6 +48,7 @@ enum class Token_t {
     SUB,
     MUL,
     DIV,
+    ASSIGN,
     ASIIC,
     UNKNOWN
 };
@@ -55,12 +58,13 @@ double                              g_number_val;
 Token_t                             g_current_token_type;
 std::map<std::string, llvm::Value*> g_named_values;
 
-const std::map<char, Token_t> g_char_token = {{'(', Token_t::LEFT_PAREN}, {')', Token_t::RIGHT_PAREM}, {',', Token_t::COMMA},
-                                              {'+', Token_t::ADD},        {'-', Token_t::SUB},         {'*', Token_t::MUL},
-                                              {'/', Token_t::DIV},        {'<', Token_t::LESS_THAN},   {'>', Token_t::GREAT_THAN}};
+const std::map<char, Token_t> g_char_token = {
+    {'(', Token_t::LEFT_PAREN}, {')', Token_t::RIGHT_PAREM}, {',', Token_t::COMMA},     {'+', Token_t::ADD},        {'-', Token_t::SUB},
+    {'*', Token_t::MUL},        {'/', Token_t::DIV},         {'<', Token_t::LESS_THAN}, {'>', Token_t::GREAT_THAN}, {'=', Token_t::ASSIGN}};
 
-const std::map<std::string, Token_t> g_keyword_token = {
-    {"if", Token_t::IF}, {"then", Token_t::THEN}, {"else", Token_t::ELSE}, {"def", Token_t::DEF}, {"extern", Token_t::EXTERN}};
+const std::map<std::string, Token_t> g_keyword_token = {{"if", Token_t::IF},    {"then", Token_t::THEN},     {"else", Token_t::ELSE},
+                                                        {"def", Token_t::DEF},  {"extern", Token_t::EXTERN}, {"for", Token_t::FOR},
+                                                        {"incr", Token_t::INCR}};
 
 const std::map<Token_t, int> g_binop_precedence = {{Token_t::LESS_THAN, 10}, {Token_t::GREAT_THAN, 10}, {Token_t::ADD, 20},
                                                    {Token_t::SUB, 20},       {Token_t::MUL, 30},        {Token_t::DIV, 30}};
@@ -282,6 +286,31 @@ public:
         pn->addIncoming(then_val, then_block);
         pn->addIncoming(else_val, else_block);
         return pn;
+    }
+};
+
+class ForExprAST : public ExprAST {
+private:
+    std::string              m_var_name;
+    std::unique_ptr<ExprAST> m_start;
+    std::unique_ptr<ExprAST> m_end;
+    std::unique_ptr<ExprAST> m_step;
+    std::unique_ptr<ExprAST> m_loop_body;
+
+public:
+    ForExprAST(
+        const std::string& var_name, std::unique_ptr<ExprAST> start, std::unique_ptr<ExprAST> end, std::unique_ptr<ExprAST> step,
+        std::unique_ptr<ExprAST> loop_body)
+        : m_var_name(var_name)
+        , m_start(std::move(start))
+        , m_end(std::move(end))
+        , m_step(std::move(step))
+        , m_loop_body(std::move(loop_body)) {
+    }
+
+    llvm::Value* CodeGen() override {
+        // TODO
+        return nullptr;
     }
 };
 
@@ -507,6 +536,69 @@ std::unique_ptr<PrototypeAST> ParseExtern() {
     return ParsePrototype();
 }
 
+std::unique_ptr<ForExprAST> ParseForExpr() {
+    GetNextToken();
+    if (g_current_token_type != Token_t::IDENTIFIER) {
+        fprintf(stderr, "Expected an identifier after 'for'\n");
+        return nullptr;
+    }
+
+    std::string var_name = g_identifier_string;
+    GetNextToken();
+    if (g_current_token_type != Token_t::ASSIGN) {
+        fprintf(stderr, "Expected '=' after 'for'\n");
+        return nullptr;
+    }
+
+    GetNextToken();
+    auto start = ParseExpression();
+    if (nullptr == start) {
+        fprintf(stderr, "invalid start in for loop\n");
+        return nullptr;
+    }
+
+    // GetNextToken();
+    if (g_current_token_type != Token_t::COMMA) {
+        fprintf(stderr, "Expected an comma after start in for loop\n");
+        return nullptr;
+    }
+
+    GetNextToken();
+    auto end = ParseExpression();
+    if (nullptr == end) {
+        fprintf(stderr, "invalid end condition in for loop\n");
+        return nullptr;
+    }
+
+    // GetNextToken();
+    if (g_current_token_type != Token_t::COMMA) {
+        fprintf(stderr, "Expected an comma after condition in for loop\n");
+        return nullptr;
+    }
+
+    GetNextToken();
+    auto step = ParseExpression();
+    if (nullptr == step) {
+        fprintf(stderr, "invalid step in for loop\n");
+        return nullptr;
+    }
+
+    // GetNextToken();
+    if (g_current_token_type != Token_t::INCR) {
+        fprintf(stderr, "Expected an incr after step in for loop\n");
+        return nullptr;
+    }
+
+    GetNextToken();
+    auto loop_body = ParseExpression();
+    if (loop_body == step) {
+        fprintf(stderr, "invalid loop body in for loop\n");
+        return nullptr;
+    }
+
+    return std::make_unique<ForExprAST>(var_name, std::move(start), std::move(end), std::move(step), std::move(loop_body));
+}
+
 // toplevelexpr ::= expression
 std::unique_ptr<FunctionAST> ParseTopLevelExpr() {
     auto proto = std::make_unique<PrototypeAST>("__anonymous_expr__", std::vector<std::string>{});
@@ -528,6 +620,19 @@ static void InitializeModule() {
     g_fpm->add(llvm::createGVNPass());
     g_fpm->add(llvm::createCFGSimplificationPass());
     g_fpm->doInitialization();
+}
+
+static void HandleDefination() {
+    auto pd_ast = ParseDefinition();
+    std::cout << "parsed a function definition" << std::endl;
+    pd_ast->CodeGen()->print(llvm::outs());
+    std::cout << std::endl;
+#ifdef USE_JIT
+    // 定义的函数注册至 JIT，并注册新的模块与优化器
+    // 否则在 JIT 模式下第二次调用函数会出现未定义的错误
+    ExitOnErr(g_jit->addModule(llvm::orc::ThreadSafeModule(std::move(g_module), std::move(g_llvm_context))));
+    InitializeModule();
+#endif
 }
 
 static void HandleTopLevelExpression() {
@@ -557,6 +662,30 @@ static void HandleTopLevelExpression() {
     }
 }
 
+static void HandleExtern() {
+    auto pe_ast = ParseExtern();
+    std::cout << "parsed a extern" << std::endl;
+    auto pe_ast_code = pe_ast->CodeGen();
+    if (pe_ast_code) {
+        pe_ast_code->print(llvm::outs());
+        std::cout << std::endl;
+        g_function_protos.emplace(pe_ast->GetName(), std::move(pe_ast));
+    } else {
+        std::cout << "parse extern expr failed" << std::endl;
+    }
+}
+
+static void HandleForExpression() {
+    auto for_ast = ParseForExpr();
+    std::cout << "parsed a for loop" << std::endl;
+    auto for_ast_code = for_ast->CodeGen();
+    if (for_ast_code) {
+        for_ast_code->print(llvm::outs());
+    } else {
+        std::cerr << "failed to generate IR for 'for' loop" << std::endl;
+    }
+}
+
 static void MainLoop() {
     while (true) {
         std::cout << "\033[31mReady > \033[0m";
@@ -565,24 +694,15 @@ static void MainLoop() {
             case Token_t::END_OF_FILE:
                 return;
             case Token_t::DEF: {
-                auto pd_ast = ParseDefinition();
-                std::cout << "parsed a function definition" << std::endl;
-                pd_ast->CodeGen()->print(llvm::outs());
-                std::cout << std::endl;
-#ifdef USE_JIT
-                // 定义的函数注册至 JIT，并注册新的模块与优化器
-                // 否则在 JIT 模式下第二次调用函数会出现未定义的错误
-                ExitOnErr(g_jit->addModule(llvm::orc::ThreadSafeModule(std::move(g_module), std::move(g_llvm_context))));
-                InitializeModule();
-#endif
+                HandleDefination();
                 break;
             }
             case Token_t::EXTERN: {
-                auto pe_ast = ParseExtern();
-                std::cout << "parsed a extern" << std::endl;
-                pe_ast->CodeGen()->print(llvm::outs());
-                std::cout << std::endl;
-                g_function_protos.emplace(pe_ast->GetName(), std::move(pe_ast));
+                HandleExtern();
+                break;
+            }
+            case Token_t::FOR: {
+                HandleForExpression();
                 break;
             }
             case Token_t::ASIIC: {
@@ -597,6 +717,17 @@ static void MainLoop() {
         g_identifier_string  = "";
         g_current_token_type = Token_t::END_OF_FILE;
     }
+}
+
+extern "C" double putchard(double X) {
+    fputc((char)X, stdout);
+    std::cout << std::endl;
+    return 0;
+}
+
+extern "C" double printd(double X) {
+    fprintf(stdout, "%f\n", X);
+    return 0;
 }
 
 int main() {

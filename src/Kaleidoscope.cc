@@ -259,7 +259,8 @@ public:
 
     llvm::Value* CodeGen() override {
         llvm::Value* cond_val = m_cond->CodeGen();
-        cond_val              = g_ir_builder->CreateFCmpONE(cond_val, llvm::ConstantFP::get(*g_llvm_context, llvm::APFloat(0.0)), "ifcond");
+        // Convert condition to a bool by comparing non-equal to 0.0
+        cond_val = g_ir_builder->CreateFCmpONE(cond_val, llvm::ConstantFP::get(*g_llvm_context, llvm::APFloat(0.0)), "ifcond");
 
         llvm::Function*   func        = g_ir_builder->GetInsertBlock()->getParent();
         llvm::BasicBlock* then_block  = llvm::BasicBlock::Create(*g_llvm_context, "then", func);
@@ -308,9 +309,78 @@ public:
         , m_loop_body(std::move(loop_body)) {
     }
 
+    /*
+        define double @__anonymous_expr__() {
+            entry:
+                br label %loop
+
+            loop:                    ; preds = %loop, %entry
+                %i = phi double [ 1.000000e+00, %entry ], [ %next_val, %loop ]
+                %next_val = fadd double %i, 1.000000e+00
+                %cmptmp = fcmp ult double %i, 1.000000e+01
+                br i1 %cmptmp, label %loop, label %after_loop
+
+            after_loop:              ; preds = %loop
+                ret double 0.000000e+00
+        }
+    */
     llvm::Value* CodeGen() override {
         // TODO
-        return nullptr;
+        llvm::Value* init_val = m_start->CodeGen();
+        if (nullptr == init_val) {
+            fprintf(stderr, "failed to generate code of for star body\n");
+            return nullptr;
+        }
+
+        llvm::Function*   cur_func   = g_ir_builder->GetInsertBlock()->getParent();
+        llvm::BasicBlock* init_block = g_ir_builder->GetInsertBlock();
+        llvm::BasicBlock* loop_block = llvm::BasicBlock::Create(*g_llvm_context, "loop", cur_func);
+
+        g_ir_builder->CreateBr(loop_block);
+        g_ir_builder->SetInsertPoint(loop_block);
+
+        llvm::PHINode* phi_node = g_ir_builder->CreatePHI(llvm::Type::getDoubleTy(*g_llvm_context), 2, m_var_name);
+        phi_node->addIncoming(init_val, init_block);
+
+        bool         is_existed_var_name      = g_named_values.find(m_var_name) == g_named_values.end();
+        llvm::Value* saved_the_same_named_var = is_existed_var_name ? g_named_values[m_var_name] : nullptr;
+
+        g_named_values[m_var_name] = phi_node;
+
+        if (nullptr == m_loop_body->CodeGen()) {
+            fprintf(stderr, "failed to generate code of for loop body\n");
+            return nullptr;
+        }
+
+        llvm::Value* step_val = m_step->CodeGen();
+        if (nullptr == step_val) {
+            fprintf(stderr, "failed to generate code of for loop step\n");
+            return nullptr;
+        }
+
+        llvm::Value* next_val = g_ir_builder->CreateFAdd(phi_node, step_val, "next_val");
+
+        llvm::Value* end_val = m_end->CodeGen();
+        if (nullptr == end_val) {
+            fprintf(stderr, "failed to generate code of for loop end\n");
+            return nullptr;
+        }
+
+        // Convert condition to a bool by comparing non-equal to 0.0
+        end_val = g_ir_builder->CreateFCmpONE(end_val, llvm::ConstantFP::get(*g_llvm_context, llvm::APFloat(0.0)), "loopend");
+
+        llvm::BasicBlock* loop_end_block   = g_ir_builder->GetInsertBlock();
+        llvm::BasicBlock* after_loop_block = llvm::BasicBlock::Create(*g_llvm_context, "after_loop", cur_func);
+
+        g_ir_builder->CreateCondBr(end_val, loop_block, after_loop_block);
+        g_ir_builder->SetInsertPoint(after_loop_block);
+
+        phi_node->addIncoming(next_val, loop_end_block);
+
+        if (is_existed_var_name) {
+            g_named_values[m_var_name] = saved_the_same_named_var;
+        }
+        return llvm::Constant::getNullValue(llvm::Type::getDoubleTy(*g_llvm_context));
     }
 };
 
@@ -380,6 +450,7 @@ public:
         if (ret_val) {
             g_ir_builder->CreateRet(ret_val);
             llvm::verifyFunction(*func);
+            // TODO: for 循环会崩溃在这里
             g_fpm->run(*func);
             return func;
         }
@@ -453,6 +524,8 @@ std::unique_ptr<ExprAST> ParseIfExpr() {
     return std::make_unique<IfExprAST>(std::move(cond), std::move(then_expr), std::move(else_expr));
 }
 
+std::unique_ptr<ForExprAST> ParseForExpr();
+
 // primary
 //   ::= identifierexpr
 //   ::= numberexpr
@@ -467,6 +540,8 @@ std::unique_ptr<ExprAST> ParsePrimary() {
             return ParseParenExpr();
         case Token_t::IF:
             return ParseIfExpr();
+        case Token_t::FOR:
+            return ParseForExpr();
         default:
             break;
     }
@@ -701,10 +776,10 @@ static void MainLoop() {
                 HandleExtern();
                 break;
             }
-            case Token_t::FOR: {
-                HandleForExpression();
-                break;
-            }
+            // case Token_t::FOR: {
+            //     HandleForExpression();
+            //     break;
+            // }
             case Token_t::ASIIC: {
                 // std::cout << "parsed a ASIIC: " << g_identifier_string << std::endl;
                 break;

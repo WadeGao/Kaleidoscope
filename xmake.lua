@@ -15,5 +15,3 @@ target("Kaleidoscope")
         add_links("LLVM")
         add_ldflags("--verbose")
     end
-
--- TODO: 使用JIT时，因为 g_module 重新创建，无法重复调用函数

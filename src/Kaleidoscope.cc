@@ -310,19 +310,21 @@ public:
     }
 
     /*
-        define double @__anonymous_expr__() {
-            entry:
-                br label %loop
+    define double @__anonymous_expr_fixed__() {
+        entry:
+            br label %loop
 
-            loop:                    ; preds = %loop, %entry
-                %i = phi double [ 1.000000e+00, %entry ], [ %next_val, %loop ]
-                %next_val = fadd double %i, 1.000000e+00
-                %cmptmp = fcmp ult double %i, 1.000000e+01
-                br i1 %cmptmp, label %loop, label %after_loop
-
-            after_loop:              ; preds = %loop
-                ret double 0.000000e+00
-        }
+        loop:                                             ; preds = %loop, %entry
+            %i = phi double [ 1.000000e+00, %entry ], [ %next_val, %loop ]
+            %cmptmp = fcmp ult double %i, 1.000000e+01
+            br i1 %cmptmp, label %body, label %after_loop
+        body:
+            %__calleetmp_putchard__ = call double @putchard(double 5.600000e+01)
+            %next_val = fadd double %i, 1.000000e+00
+            br label %loop
+        after_loop:                                       ; preds = %loop
+            ret double 0.000000e+00
+    }
     */
     llvm::Value* CodeGen() override {
         // TODO
@@ -332,20 +334,40 @@ public:
             return nullptr;
         }
 
-        llvm::Function*   cur_func   = g_ir_builder->GetInsertBlock()->getParent();
-        llvm::BasicBlock* init_block = g_ir_builder->GetInsertBlock();
-        llvm::BasicBlock* loop_block = llvm::BasicBlock::Create(*g_llvm_context, "loop", cur_func);
+        llvm::Function* cur_func = g_ir_builder->GetInsertBlock()->getParent();
 
+        // 预创建所有用到的四个标签
+        llvm::BasicBlock* entry_block = g_ir_builder->GetInsertBlock();
+        llvm::BasicBlock* loop_block  = llvm::BasicBlock::Create(*g_llvm_context, "loop", cur_func);
+        llvm::BasicBlock* body_block  = llvm::BasicBlock::Create(*g_llvm_context, "body", cur_func);
+        llvm::BasicBlock* after_loop  = llvm::BasicBlock::Create(*g_llvm_context, "after_loop", cur_func);
+
+        // 指定代码插入点为 entry 标签处
+        g_ir_builder->SetInsertPoint(entry_block);
+        // 无条件跳转到 loop 标签
         g_ir_builder->CreateBr(loop_block);
-        g_ir_builder->SetInsertPoint(loop_block);
 
-        llvm::PHINode* phi_node = g_ir_builder->CreatePHI(llvm::Type::getDoubleTy(*g_llvm_context), 2, m_var_name);
-        phi_node->addIncoming(init_val, init_block);
+        // 指定代码插入点为 loop 标签处
+        g_ir_builder->SetInsertPoint(loop_block);
+        llvm::PHINode* var = g_ir_builder->CreatePHI(llvm::Type::getDoubleTy(*g_llvm_context), 2, m_var_name);
+        var->addIncoming(init_val, entry_block);
 
         bool         is_existed_var_name      = g_named_values.find(m_var_name) == g_named_values.end();
         llvm::Value* saved_the_same_named_var = is_existed_var_name ? g_named_values[m_var_name] : nullptr;
+        g_named_values[m_var_name]            = var;
 
-        g_named_values[m_var_name] = phi_node;
+        llvm::Value* end_cond = m_end->CodeGen();
+        if (nullptr == end_cond) {
+            fprintf(stderr, "failed to generate code of for loop end\n");
+            return nullptr;
+        }
+
+        // Convert condition to a bool by comparing non-equal to 0.0
+        end_cond = g_ir_builder->CreateFCmpONE(end_cond, llvm::ConstantFP::get(*g_llvm_context, llvm::APFloat(0.0)), "loop_end_cond");
+        g_ir_builder->CreateCondBr(end_cond, body_block, after_loop);
+
+        // 指定代码插入点为 body 标签处
+        g_ir_builder->SetInsertPoint(body_block);
 
         if (nullptr == m_loop_body->CodeGen()) {
             fprintf(stderr, "failed to generate code of for loop body\n");
@@ -358,25 +380,14 @@ public:
             return nullptr;
         }
 
-        llvm::Value* next_val = g_ir_builder->CreateFAdd(phi_node, step_val, "next_val");
+        llvm::Value*      next_val                  = g_ir_builder->CreateFAdd(var, step_val, "next_val");
+        llvm::BasicBlock* generating_next_val_block = g_ir_builder->GetInsertBlock();
+        g_ir_builder->CreateBr(loop_block);
 
-        llvm::Value* end_val = m_end->CodeGen();
-        if (nullptr == end_val) {
-            fprintf(stderr, "failed to generate code of for loop end\n");
-            return nullptr;
-        }
+        var->addIncoming(next_val, generating_next_val_block);
 
-        // Convert condition to a bool by comparing non-equal to 0.0
-        end_val = g_ir_builder->CreateFCmpONE(end_val, llvm::ConstantFP::get(*g_llvm_context, llvm::APFloat(0.0)), "loopend");
-
-        llvm::BasicBlock* loop_end_block   = g_ir_builder->GetInsertBlock();
-        llvm::BasicBlock* after_loop_block = llvm::BasicBlock::Create(*g_llvm_context, "after_loop", cur_func);
-
-        g_ir_builder->CreateCondBr(end_val, loop_block, after_loop_block);
-        g_ir_builder->SetInsertPoint(after_loop_block);
-
-        phi_node->addIncoming(next_val, loop_end_block);
-
+        // 指定代码插入点为 after_loop 标签处
+        g_ir_builder->SetInsertPoint(after_loop);
         if (is_existed_var_name) {
             g_named_values[m_var_name] = saved_the_same_named_var;
         }

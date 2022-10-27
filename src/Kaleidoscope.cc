@@ -173,6 +173,10 @@ public:
         : m_name(name) {
     }
 
+    const std::string& GetName() const {
+        return m_name;
+    }
+
     llvm::Value* CodeGen() override {
         auto stacked_var_iter = g_named_values.find(m_name);
         if (stacked_var_iter == g_named_values.end()) {
@@ -199,6 +203,29 @@ public:
     }
 
     llvm::Value* CodeGen() override {
+        if (m_op == Token_t::ASSIGN) {
+            VarExprAST* lhs_expr = static_cast<VarExprAST*>(m_lhs.get());
+            if (nullptr == lhs_expr) {
+                fprintf(stderr, "destination of '=' must be a var\n");
+                return nullptr;
+            }
+
+            llvm::Value* val = m_rhs->CodeGen();
+            if (nullptr == val) {
+                fprintf(stderr, "failed to generate source of '='\n");
+                return nullptr;
+            }
+
+            llvm::Value* var = g_named_values[lhs_expr->GetName()];
+            if (nullptr == var) {
+                fprintf(stderr, "unknown variable name: %s\n", lhs_expr->GetName().c_str());
+                return nullptr;
+            }
+
+            g_ir_builder->CreateStore(val, var);
+            return val;
+        }
+
         llvm::Value* lhs = m_lhs->CodeGen();
         llvm::Value* rhs = m_rhs->CodeGen();
         switch (m_op) {

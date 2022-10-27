@@ -19,6 +19,7 @@
 #include <llvm/Transforms/InstCombine/InstCombine.h>
 #include <llvm/Transforms/Scalar.h>
 #include <llvm/Transforms/Scalar/GVN.h>
+#include <llvm/Transforms/Utils.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -54,10 +55,10 @@ enum class Token_t {
     UNKNOWN
 };
 
-std::string                         g_identifier_string;
-double                              g_number_val;
-Token_t                             g_current_token_type;
-std::map<std::string, llvm::Value*> g_named_values;
+std::string                              g_identifier_string;
+double                                   g_number_val;
+Token_t                                  g_current_token_type;
+std::map<std::string, llvm::AllocaInst*> g_named_values;
 
 const std::map<char, Token_t> g_char_token = {
     {'(', Token_t::LEFT_PAREN}, {')', Token_t::RIGHT_PAREM}, {',', Token_t::COMMA},     {'+', Token_t::ADD},        {'-', Token_t::SUB},
@@ -138,6 +139,11 @@ Token_t GetNextToken() {
     return g_current_token_type = GetToken();
 }
 
+static llvm::AllocaInst* CreateEntryBlockAlloca(llvm::Function* func, const std::string& var_name) {
+    llvm::IRBuilder<> tmp_ir_builder(&func->getEntryBlock(), func->getEntryBlock().begin());
+    return tmp_ir_builder.CreateAlloca(llvm::Type::getDoubleTy(*g_llvm_context), nullptr, var_name.c_str());
+}
+
 class ExprAST {
 public:
     virtual ~ExprAST()             = default;
@@ -165,11 +171,16 @@ public:
     VarExprAST(const std::string& name)
         : m_name(name) {
     }
+
     llvm::Value* CodeGen() override {
-        if (g_named_values.find(m_name) == g_named_values.end()) {
+        auto stacked_var_iter = g_named_values.find(m_name);
+        if (stacked_var_iter == g_named_values.end()) {
+            fprintf(stderr, "unknown var named %s\n", m_name.c_str());
             return nullptr;
         }
-        return g_named_values.at(m_name);
+
+        llvm::AllocaInst* stacked_var = stacked_var_iter->second;
+        return g_ir_builder->CreateLoad(stacked_var->getAllocatedType(), stacked_var, m_name.c_str());
     }
 };
 
@@ -312,28 +323,24 @@ public:
     /*
     define double @__anonymous_expr_fixed__() {
         entry:
+            %i = alloca double
+            store %init_val, double* %i
             br label %loop
 
         loop:                                             ; preds = %loop, %entry
-            %i = phi double [ 1.000000e+00, %entry ], [ %next_val, %loop ]
-            %cmptmp = fcmp ult double %i, 1.000000e+01
+            %cur_val = load double, double* %i
+            %cmptmp = fcmp ult double %cur_val, 1.000000e+01
             br i1 %cmptmp, label %body, label %after_loop
         body:
             %__calleetmp_putchard__ = call double @putchard(double 5.600000e+01)
-            %next_val = fadd double %i, 1.000000e+00
+            %next_val = fadd double %cur_val, 1.000000e+00
+            store %next_val, double* %i
             br label %loop
         after_loop:                                       ; preds = %loop
             ret double 0.000000e+00
     }
     */
     llvm::Value* CodeGen() override {
-        // TODO
-        llvm::Value* init_val = m_start->CodeGen();
-        if (nullptr == init_val) {
-            fprintf(stderr, "failed to generate code of for star body\n");
-            return nullptr;
-        }
-
         llvm::Function* cur_func = g_ir_builder->GetInsertBlock()->getParent();
 
         // 预创建所有用到的四个标签
@@ -344,17 +351,20 @@ public:
 
         // 指定代码插入点为 entry 标签处
         g_ir_builder->SetInsertPoint(entry_block);
-        // 无条件跳转到 loop 标签
+        llvm::AllocaInst* alloca   = CreateEntryBlockAlloca(cur_func, m_var_name);
+        llvm::Value*      init_val = m_start->CodeGen();
+        if (nullptr == init_val) {
+            fprintf(stderr, "failed to generate code of for star body\n");
+            return nullptr;
+        }
+        g_ir_builder->CreateStore(init_val, alloca);
         g_ir_builder->CreateBr(loop_block);
 
         // 指定代码插入点为 loop 标签处
         g_ir_builder->SetInsertPoint(loop_block);
-        llvm::PHINode* var = g_ir_builder->CreatePHI(llvm::Type::getDoubleTy(*g_llvm_context), 2, m_var_name);
-        var->addIncoming(init_val, entry_block);
 
-        bool         is_existed_var_name      = g_named_values.find(m_var_name) == g_named_values.end();
-        llvm::Value* saved_the_same_named_var = is_existed_var_name ? g_named_values[m_var_name] : nullptr;
-        g_named_values[m_var_name]            = var;
+        llvm::AllocaInst* old_val  = g_named_values[m_var_name];
+        g_named_values[m_var_name] = alloca;
 
         llvm::Value* end_cond = m_end->CodeGen();
         if (nullptr == end_cond) {
@@ -380,17 +390,20 @@ public:
             return nullptr;
         }
 
-        llvm::Value*      next_val                  = g_ir_builder->CreateFAdd(var, step_val, "next_val");
-        llvm::BasicBlock* generating_next_val_block = g_ir_builder->GetInsertBlock();
+        llvm::Value* cur_val  = g_ir_builder->CreateLoad(alloca->getAllocatedType(), alloca, m_var_name.c_str());
+        llvm::Value* next_val = g_ir_builder->CreateFAdd(cur_val, step_val, "next_val");
+        g_ir_builder->CreateStore(next_val, alloca);
         g_ir_builder->CreateBr(loop_block);
-
-        var->addIncoming(next_val, generating_next_val_block);
 
         // 指定代码插入点为 after_loop 标签处
         g_ir_builder->SetInsertPoint(after_loop);
-        if (is_existed_var_name) {
-            g_named_values[m_var_name] = saved_the_same_named_var;
+
+        if (old_val) {
+            g_named_values[m_var_name] = old_val;
+        } else {
+            g_named_values.erase(m_var_name);
         }
+
         return llvm::Constant::getNullValue(llvm::Type::getDoubleTy(*g_llvm_context));
     }
 };
@@ -454,15 +467,20 @@ public:
         // 预设了 Kaleidoscope 的 VariableExpr 只存在于函数内对函数参数的引用
         g_named_values.clear();
         for (llvm::Value& arg : func->args()) {
-            g_named_values.emplace(arg.getName(), &arg);
+            llvm::AllocaInst* alloca = CreateEntryBlockAlloca(func, arg.getName().str());
+            g_ir_builder->CreateStore(&arg, alloca);
+            g_named_values[arg.getName().str()] = alloca;
         }
 
         llvm::Value* ret_val = m_body->CodeGen();
         if (ret_val) {
             g_ir_builder->CreateRet(ret_val);
             llvm::verifyFunction(*func);
+
+#ifdef ENABLE_OPTIMIZER
             // TODO: for 循环会崩溃在这里
             g_fpm->run(*func);
+#endif
             return func;
         }
 
@@ -700,12 +718,15 @@ static void InitializeModule() {
 #endif
     g_ir_builder = std::make_unique<llvm::IRBuilder<>>(*g_llvm_context);
 
+#ifdef ENABLE_OPTIMIZER
     g_fpm = std::make_unique<llvm::legacy::FunctionPassManager>(g_module.get());
+    g_fpm->add(llvm::createPromoteMemoryToRegisterPass());
     g_fpm->add(llvm::createInstructionCombiningPass());
     g_fpm->add(llvm::createReassociatePass());
     g_fpm->add(llvm::createGVNPass());
     g_fpm->add(llvm::createCFGSimplificationPass());
     g_fpm->doInitialization();
+#endif
 }
 
 static void HandleDefination() {

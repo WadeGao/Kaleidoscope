@@ -8,7 +8,7 @@ target("Kaleidoscope")
     add_files("src/**.cc")
     add_cxxflags("-g -v")
     add_defines("USE_JIT")
-
+    add_defines("ENABLE_OPTIMIZER")
     if is_plat("macosx") then
         add_cxxflags("-stdlib=libc++ -fuse-ld=lld")
         add_includedirs("/opt/homebrew/opt/llvm/include")

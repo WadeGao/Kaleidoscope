@@ -68,8 +68,9 @@ const std::map<std::string, Token_t> g_keyword_token = {{"if", Token_t::IF},    
                                                         {"def", Token_t::DEF},  {"extern", Token_t::EXTERN}, {"for", Token_t::FOR},
                                                         {"incr", Token_t::INCR}};
 
-const std::map<Token_t, int> g_binop_precedence = {{Token_t::LESS_THAN, 10}, {Token_t::GREAT_THAN, 10}, {Token_t::ADD, 20},
-                                                   {Token_t::SUB, 20},       {Token_t::MUL, 30},        {Token_t::DIV, 30}};
+const std::map<Token_t, int> g_binop_precedence = {{Token_t::ASSIGN, 2}, {Token_t::LESS_THAN, 10}, {Token_t::GREAT_THAN, 10},
+                                                   {Token_t::ADD, 20},   {Token_t::SUB, 20},       {Token_t::MUL, 30},
+                                                   {Token_t::DIV, 30}};
 
 static llvm::ExitOnError ExitOnErr;
 llvm::Function*          GetFunction(const std::string& func_name);
@@ -277,6 +278,8 @@ public:
         llvm::BasicBlock* final_block = llvm::BasicBlock::Create(*g_llvm_context, "final", func);
 
         // calculate and init the cond val, then branch to if-else body
+        llvm::AllocaInst* alloca = CreateEntryBlockAlloca(func, "");
+
         llvm::Value* cond_val =
             g_ir_builder->CreateFCmpONE(m_cond->CodeGen(), llvm::ConstantFP::get(*g_llvm_context, llvm::APFloat(0.0)), "cond_val");
         g_ir_builder->CreateCondBr(cond_val, then_block, else_block);
@@ -284,20 +287,18 @@ public:
         // move the insert point cursor to the 'then' tag
         g_ir_builder->SetInsertPoint(then_block);
         llvm::Value* then_val = m_then_expr->CodeGen();
+        g_ir_builder->CreateStore(then_val, alloca);
         g_ir_builder->CreateBr(final_block);
 
         // move the insert point cursor to the 'else' tag
         g_ir_builder->SetInsertPoint(else_block);
         llvm::Value* else_val = m_else_expr->CodeGen();
+        g_ir_builder->CreateStore(else_val, alloca);
         g_ir_builder->CreateBr(final_block);
 
         // move the insert point cursor to the 'final' tag
         g_ir_builder->SetInsertPoint(final_block);
-        llvm::PHINode* pn = g_ir_builder->CreatePHI(llvm::Type::getDoubleTy(*g_llvm_context), 2, "phi");
-        pn->addIncoming(then_val, then_block);
-        pn->addIncoming(else_val, else_block);
-
-        return pn;
+        return g_ir_builder->CreateLoad(alloca->getAllocatedType(), alloca, "__anonymous_ret__");
     }
 };
 

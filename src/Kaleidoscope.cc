@@ -1,7 +1,5 @@
 #include "KaleidoscopeJIT.h"
-#include "llvm/Support/raw_ostream.h"
-#include <cstdint>
-#include <cstdio>
+
 #include <llvm/ADT/APFloat.h>
 #include <llvm/ADT/STLExtras.h>
 #include <llvm/IR/BasicBlock.h>
@@ -16,12 +14,15 @@
 #include <llvm/IR/Value.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/Support/TargetSelect.h>
+#include <llvm/Support/raw_ostream.h>
 #include <llvm/Target/TargetMachine.h>
 #include <llvm/Transforms/InstCombine/InstCombine.h>
 #include <llvm/Transforms/Scalar.h>
 #include <llvm/Transforms/Scalar/GVN.h>
 
 #include <cstddef>
+#include <cstdint>
+#include <cstdio>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -258,34 +259,33 @@ public:
     }
 
     llvm::Value* CodeGen() override {
-        llvm::Value* cond_val = m_cond->CodeGen();
-        // Convert condition to a bool by comparing non-equal to 0.0
-        cond_val = g_ir_builder->CreateFCmpONE(cond_val, llvm::ConstantFP::get(*g_llvm_context, llvm::APFloat(0.0)), "ifcond");
-
+        // predefine all three tags
         llvm::Function*   func        = g_ir_builder->GetInsertBlock()->getParent();
         llvm::BasicBlock* then_block  = llvm::BasicBlock::Create(*g_llvm_context, "then", func);
-        llvm::BasicBlock* else_block  = llvm::BasicBlock::Create(*g_llvm_context, "else");
-        llvm::BasicBlock* final_block = llvm::BasicBlock::Create(*g_llvm_context, "ifcont");
+        llvm::BasicBlock* else_block  = llvm::BasicBlock::Create(*g_llvm_context, "else", func);
+        llvm::BasicBlock* final_block = llvm::BasicBlock::Create(*g_llvm_context, "final", func);
 
+        // calculate and init the cond val, then branch to if-else body
+        llvm::Value* cond_val =
+            g_ir_builder->CreateFCmpONE(m_cond->CodeGen(), llvm::ConstantFP::get(*g_llvm_context, llvm::APFloat(0.0)), "cond_val");
         g_ir_builder->CreateCondBr(cond_val, then_block, else_block);
 
+        // move the insert point cursor to the 'then' tag
         g_ir_builder->SetInsertPoint(then_block);
         llvm::Value* then_val = m_then_expr->CodeGen();
         g_ir_builder->CreateBr(final_block);
-        then_block = g_ir_builder->GetInsertBlock();
 
-        func->getBasicBlockList().push_back(else_block);
+        // move the insert point cursor to the 'else' tag
         g_ir_builder->SetInsertPoint(else_block);
         llvm::Value* else_val = m_else_expr->CodeGen();
         g_ir_builder->CreateBr(final_block);
-        else_block = g_ir_builder->GetInsertBlock();
 
-        func->getBasicBlockList().push_back(final_block);
+        // move the insert point cursor to the 'final' tag
         g_ir_builder->SetInsertPoint(final_block);
-
-        llvm::PHINode* pn = g_ir_builder->CreatePHI(llvm::Type::getDoubleTy(*g_llvm_context), 2, "iftmp");
+        llvm::PHINode* pn = g_ir_builder->CreatePHI(llvm::Type::getDoubleTy(*g_llvm_context), 2, "phi");
         pn->addIncoming(then_val, then_block);
         pn->addIncoming(else_val, else_block);
+
         return pn;
     }
 };

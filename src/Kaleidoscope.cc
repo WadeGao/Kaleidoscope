@@ -707,25 +707,12 @@ int GetTokenPrecedence() {
 }
 
 std::unique_ptr<ExprAST> ParseUnary() {
-    switch (g_current_token_type) {
-        case Token_t::IDENTIFIER:
-        case Token_t::NUMBER:
-        case Token_t::LEFT_PAREN:
-        case Token_t::IF:
-        case Token_t::FOR:
-        case Token_t::COMMA:
-            return ParsePrimary();
-        default:
-            break;
+    if (auto try_parse_primary = ParsePrimary()) {
+        return try_parse_primary;
     }
 
-    /*if (g_current_token_type == Token_t::LEFT_PAREN || g_current_token_type == Token_t::COMMA ||
-        g_current_token_type == Token_t::IDENTIFIER) {
-        return ParsePrimary();
-    }*/
-
-    Token_t opcode_token_type = g_current_token_type;
-    std::string m_str_opcode = g_identifier_string;
+    Token_t     opcode_token_type = g_current_token_type;
+    std::string m_str_opcode      = g_identifier_string;
     GetNextToken();
     if (auto operand = ParseUnary()) {
         return std::make_unique<UnaryExprAST>(opcode_token_type, m_str_opcode, std::move(operand));

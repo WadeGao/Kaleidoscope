@@ -1,5 +1,6 @@
 #include "KaleidoscopeJIT.h"
 
+#include <cassert>
 #include <llvm/ADT/APFloat.h>
 #include <llvm/ADT/STLExtras.h>
 #include <llvm/IR/BasicBlock.h>
@@ -50,7 +51,15 @@ enum class Token_t {
     SUB,
     MUL,
     DIV,
+    AND,
+    OR,
+    NOT,
+    XOR,
+    COLON,
+    NEGATION,
     ASSIGN,
+    UNARY,
+    BINARY,
     ASIIC,
     UNKNOWN
 };
@@ -61,16 +70,17 @@ Token_t                                  g_current_token_type;
 std::map<std::string, llvm::AllocaInst*> g_named_values;
 
 const std::map<char, Token_t> g_char_token = {
-    {'(', Token_t::LEFT_PAREN}, {')', Token_t::RIGHT_PAREM}, {',', Token_t::COMMA},     {'+', Token_t::ADD},        {'-', Token_t::SUB},
-    {'*', Token_t::MUL},        {'/', Token_t::DIV},         {'<', Token_t::LESS_THAN}, {'>', Token_t::GREAT_THAN}, {'=', Token_t::ASSIGN}};
+    {'(', Token_t::LEFT_PAREN}, {')', Token_t::RIGHT_PAREM}, {',', Token_t::COMMA},    {'+', Token_t::ADD},
+    {'-', Token_t::SUB},        {'*', Token_t::MUL},         {'/', Token_t::DIV},      {'<', Token_t::LESS_THAN},
+    {'>', Token_t::GREAT_THAN}, {'=', Token_t::ASSIGN},      {'&', Token_t::AND},      {'|', Token_t::OR},
+    {'!', Token_t::NOT},        {'^', Token_t::XOR},         {'~', Token_t::NEGATION}, {':', Token_t::COLON}};
 
-const std::map<std::string, Token_t> g_keyword_token = {{"if", Token_t::IF},    {"then", Token_t::THEN},     {"else", Token_t::ELSE},
-                                                        {"def", Token_t::DEF},  {"extern", Token_t::EXTERN}, {"for", Token_t::FOR},
-                                                        {"incr", Token_t::INCR}};
+const std::map<std::string, Token_t> g_keyword_token = {{"if", Token_t::IF},     {"then", Token_t::THEN},     {"else", Token_t::ELSE},
+                                                        {"def", Token_t::DEF},   {"extern", Token_t::EXTERN}, {"for", Token_t::FOR},
+                                                        {"incr", Token_t::INCR}, {"binary", Token_t::BINARY}, {"unary", Token_t::UNARY}};
 
-const std::map<Token_t, int> g_binop_precedence = {{Token_t::ASSIGN, 2}, {Token_t::LESS_THAN, 10}, {Token_t::GREAT_THAN, 10},
-                                                   {Token_t::ADD, 20},   {Token_t::SUB, 20},       {Token_t::MUL, 30},
-                                                   {Token_t::DIV, 30}};
+std::map<Token_t, int> g_binop_precedence = {{Token_t::ASSIGN, 2}, {Token_t::LESS_THAN, 10}, {Token_t::GREAT_THAN, 10}, {Token_t::ADD, 20},
+                                             {Token_t::SUB, 20},   {Token_t::MUL, 30},       {Token_t::DIV, 30}};
 
 static llvm::ExitOnError ExitOnErr;
 llvm::Function*          GetFunction(const std::string& func_name);
@@ -178,26 +188,27 @@ public:
     }
 
     llvm::Value* CodeGen() override {
-        auto stacked_var_iter = g_named_values.find(m_name);
-        if (stacked_var_iter == g_named_values.end()) {
+        llvm::AllocaInst* alloca = g_named_values[m_name];
+        if (nullptr == alloca) {
             fprintf(stderr, "unknown var named %s\n", m_name.c_str());
             return nullptr;
         }
 
-        llvm::AllocaInst* stacked_var = stacked_var_iter->second;
-        return g_ir_builder->CreateLoad(stacked_var->getAllocatedType(), stacked_var, m_name.c_str());
+        return g_ir_builder->CreateLoad(alloca->getAllocatedType(), alloca, m_name.c_str());
     }
 };
 
 class BinaryExprAST : public ExprAST {
 private:
     Token_t                  m_op;
+    std::string              m_str_op;
     std::unique_ptr<ExprAST> m_lhs;
     std::unique_ptr<ExprAST> m_rhs;
 
 public:
-    BinaryExprAST(const Token_t op, std::unique_ptr<ExprAST> lhs, std::unique_ptr<ExprAST> rhs)
+    BinaryExprAST(const Token_t op, const std::string& str_op, std::unique_ptr<ExprAST> lhs, std::unique_ptr<ExprAST> rhs)
         : m_op(op)
+        , m_str_op(str_op)
         , m_lhs(std::move(lhs))
         , m_rhs(std::move(rhs)) {
     }
@@ -248,7 +259,15 @@ public:
             default:
                 break;
         }
-        return nullptr;
+
+        // if not a builtin binary operator, it should be a user defined one
+        std::string     func_name = std::string("binary") + m_str_op;
+        llvm::Function* func      = GetFunction(func_name);
+        if (nullptr == func) {
+            fprintf(stderr, "binary operator [%s] not found\n", func_name.c_str());
+            return nullptr;
+        }
+        return g_ir_builder->CreateCall(func, {lhs, rhs}, func_name);
     }
 };
 
@@ -440,20 +459,56 @@ class PrototypeAST {
 private:
     std::string              m_name;
     std::vector<std::string> m_args;
+    bool                     m_is_operator;
+    Token_t                  m_operator_token_type;
+    std::size_t              m_precedence;
 
 public:
-    PrototypeAST(std::string& name, std::vector<std::string>& args)
+    PrototypeAST(
+        std::string& name, std::vector<std::string>& args, bool is_operator = false, Token_t operator_token_type = Token_t::UNKNOWN,
+        std::size_t precedence = 0)
         : m_name(name)
-        , m_args(args) {
+        , m_args(args)
+        , m_is_operator(is_operator)
+        , m_operator_token_type(operator_token_type)
+        , m_precedence(precedence) {
     }
 
-    PrototypeAST(std::string&& name, std::vector<std::string>&& args)
+    PrototypeAST(
+        std::string&& name, std::vector<std::string>&& args, bool is_operator = false, Token_t operator_token_type = Token_t::UNKNOWN,
+        std::size_t precedence = 0)
         : m_name(std::move(name))
-        , m_args(std::move(args)) {
+        , m_args(std::move(args))
+        , m_is_operator(is_operator)
+        , m_operator_token_type(operator_token_type)
+        , m_precedence(precedence) {
     }
 
     const std::string& GetName() const {
         return m_name;
+    }
+
+    bool IsUnaryOperator() const {
+        return m_is_operator && m_args.size() == 1;
+    }
+
+    bool IsBinaryOperator() const {
+        return m_is_operator && m_args.size() == 2;
+    }
+
+    char GetOperatorName() const {
+        assert(IsUnaryOperator() || IsBinaryOperator());
+        return m_name[m_name.size() - 1];
+    }
+
+    Token_t GetOperatorTokenType() const {
+        assert(IsUnaryOperator() || IsBinaryOperator());
+        return m_operator_token_type;
+    }
+
+    std::size_t GetBinaryPrecedence() const {
+        assert(IsBinaryOperator());
+        return m_precedence;
     }
 
     llvm::Function* CodeGen() {
@@ -490,6 +545,11 @@ public:
             return nullptr;
         }
 
+        // TODO
+        if (cur_proto.IsBinaryOperator()) {
+            g_binop_precedence[cur_proto.GetOperatorTokenType()] = cur_proto.GetBinaryPrecedence();
+        }
+
         llvm::BasicBlock* block = llvm::BasicBlock::Create(*g_llvm_context, "entry", func);
         g_ir_builder->SetInsertPoint(block);
         // 预设了 Kaleidoscope 的 VariableExpr 只存在于函数内对函数参数的引用
@@ -513,7 +573,43 @@ public:
         }
 
         func->eraseFromParent();
+
+        if (cur_proto.IsBinaryOperator()) {
+            g_binop_precedence.erase(cur_proto.GetOperatorTokenType());
+        }
+
         return nullptr;
+    }
+};
+
+class UnaryExprAST : public ExprAST {
+private:
+    Token_t                  m_opcode;
+    std::string              m_str_opcode;
+    std::unique_ptr<ExprAST> m_operand;
+
+public:
+    UnaryExprAST(const Token_t opcode, std::string str_opcode, std::unique_ptr<ExprAST> operand)
+        : m_opcode(opcode)
+        , m_str_opcode(str_opcode)
+        , m_operand(std::move(operand)) {
+    }
+
+    llvm::Value* CodeGen() override {
+        llvm::Value* operand_val = m_operand->CodeGen();
+        if (nullptr == operand_val) {
+            fprintf(stderr, "failed to generate code for unary operand\n");
+            return nullptr;
+        }
+
+        std::string     func_name = std::string("unary") + m_str_opcode;
+        llvm::Function* func      = GetFunction(func_name);
+        if (nullptr == func) {
+            fprintf(stderr, "failed to get function for unary operator %s\n", m_str_opcode.c_str());
+            return nullptr;
+        }
+
+        return g_ir_builder->CreateCall(func, operand_val, func_name);
     }
 };
 
@@ -610,6 +706,33 @@ int GetTokenPrecedence() {
     return it == g_binop_precedence.end() ? -1 : it->second;
 }
 
+std::unique_ptr<ExprAST> ParseUnary() {
+    switch (g_current_token_type) {
+        case Token_t::IDENTIFIER:
+        case Token_t::NUMBER:
+        case Token_t::LEFT_PAREN:
+        case Token_t::IF:
+        case Token_t::FOR:
+        case Token_t::COMMA:
+            return ParsePrimary();
+        default:
+            break;
+    }
+
+    /*if (g_current_token_type == Token_t::LEFT_PAREN || g_current_token_type == Token_t::COMMA ||
+        g_current_token_type == Token_t::IDENTIFIER) {
+        return ParsePrimary();
+    }*/
+
+    Token_t opcode_token_type = g_current_token_type;
+    std::string m_str_opcode = g_identifier_string;
+    GetNextToken();
+    if (auto operand = ParseUnary()) {
+        return std::make_unique<UnaryExprAST>(opcode_token_type, m_str_opcode, std::move(operand));
+    }
+    return nullptr;
+}
+
 // parse lhs, [binop primary] [binop primary] ...
 std::unique_ptr<ExprAST> ParseBinOpRhs(int min_precedence, std::unique_ptr<ExprAST> lhs) {
     for (;;) {
@@ -618,30 +741,86 @@ std::unique_ptr<ExprAST> ParseBinOpRhs(int min_precedence, std::unique_ptr<ExprA
             return lhs;
         }
 
-        Token_t binop = g_current_token_type;
+        Token_t     binop  = g_current_token_type;
+        std::string str_op = g_identifier_string;
         GetNextToken();
-        auto rhs = ParsePrimary();
+        auto rhs = ParseUnary();
+        if (nullptr == rhs) {
+            fprintf(stderr, "failed to parse rhs of binop\n");
+            return nullptr;
+        }
 
         // (lhs binop rhs) binop unparsed
         // lhs binop (rhs binop unparsed)
         int next_precedence = GetTokenPrecedence();
         if (cur_precedence < next_precedence) {
             rhs = ParseBinOpRhs(cur_precedence + 1, std::move(rhs));
+            if (nullptr == rhs) {
+                fprintf(stderr, "failed to parse rhs of binop\n");
+                return nullptr;
+            }
         }
-        lhs = std::make_unique<BinaryExprAST>(binop, std::move(lhs), std::move(rhs));
+        lhs = std::make_unique<BinaryExprAST>(binop, str_op, std::move(lhs), std::move(rhs));
     }
     return nullptr;
 }
 
 std::unique_ptr<ExprAST> ParseExpression() {
-    auto lhs = ParsePrimary();
+    auto lhs = ParseUnary();
+    if (nullptr == lhs) {
+        fprintf(stderr, "failed to parse lhs for expression\n");
+        return nullptr;
+    }
     return ParseBinOpRhs(0, std::move(lhs));
 }
 
 // prototype ::= id ( id, id, ... )
+//           ::= unary LETTER (id)
+//           ::= binary LETTER precedence (id, id)
 std::unique_ptr<PrototypeAST> ParsePrototype() {
-    std::string function_name = g_identifier_string;
-    GetNextToken();
+    enum class ProtoKind_t {
+        IDENTIFIER,
+        UNARY,
+        BINARY,
+        UNKNOWN
+    };
+
+    std::string function_name       = g_identifier_string;
+    ProtoKind_t kind                = ProtoKind_t::UNKNOWN;
+    std::size_t binary_precedence   = 30;
+    Token_t     operator_token_type = Token_t::UNKNOWN;
+
+    switch (g_current_token_type) {
+        case Token_t::IDENTIFIER:
+            kind = ProtoKind_t::IDENTIFIER;
+            GetNextToken();
+            break;
+        case Token_t::UNARY:
+            GetNextToken();
+            function_name += g_identifier_string;
+            operator_token_type = g_current_token_type;
+            kind                = ProtoKind_t::UNARY;
+            GetNextToken();
+            break;
+        case Token_t::BINARY:
+            GetNextToken();
+            function_name += g_identifier_string;
+            operator_token_type = g_current_token_type;
+            kind                = ProtoKind_t::BINARY;
+            GetNextToken();
+            if (g_current_token_type == Token_t::NUMBER) {
+                binary_precedence = g_number_val;
+            }
+            GetNextToken();
+            break;
+
+        default:
+            break;
+    }
+
+    // eat '('
+    // GetNextToken();
+
     std::vector<std::string> formal_args;
     while (GetNextToken() == Token_t::IDENTIFIER) {
         formal_args.push_back(g_identifier_string);
@@ -650,8 +829,11 @@ std::unique_ptr<PrototypeAST> ParsePrototype() {
             break;
         }
     }
+
     GetNextToken();
-    return std::make_unique<PrototypeAST>(std::move(function_name), std::move(formal_args));
+    bool is_operator = (kind == ProtoKind_t::UNARY || kind == ProtoKind_t::BINARY);
+    return std::make_unique<PrototypeAST>(
+        std::move(function_name), std::move(formal_args), is_operator, operator_token_type, binary_precedence);
 }
 
 // defination ::= def prototype expression

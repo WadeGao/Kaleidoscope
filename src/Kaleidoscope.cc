@@ -14,6 +14,7 @@
 #include <llvm/IR/Type.h>
 #include <llvm/IR/Value.h>
 #include <llvm/IR/Verifier.h>
+#include <llvm/MC/TargetRegistry.h>
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/Target/TargetMachine.h>
@@ -1034,7 +1035,7 @@ extern "C" double printd(double X) {
     return 0;
 }
 
-int main() {
+int main(int argc, char* argv[]) {
     llvm::InitializeNativeTarget();
     llvm::InitializeNativeTargetAsmPrinter();
     llvm::InitializeNativeTargetAsmParser();
@@ -1045,5 +1046,50 @@ int main() {
     InitializeModule();
 
     MainLoop();
+
+    llvm::InitializeAllTargetInfos();
+    llvm::InitializeAllTargets();
+    llvm::InitializeAllTargetMCs();
+    llvm::InitializeAllAsmParsers();
+    llvm::InitializeAllAsmPrinters();
+
+    auto TargetTriple = LLVMGetDefaultTargetTriple();
+    g_module->setTargetTriple(TargetTriple);
+
+    std::string error;
+    auto        target = llvm::TargetRegistry::lookupTarget(TargetTriple, error);
+    if (nullptr == target) {
+        llvm::errs() << error;
+        return 1;
+    }
+
+    auto cpu     = "generic";
+    auto feature = "";
+
+    llvm::TargetOptions target_opt;
+    auto                reloc_model    = llvm::Optional<llvm::Reloc::Model>();
+    auto                target_machine = target->createTargetMachine(TargetTriple, cpu, feature, target_opt, reloc_model);
+
+    g_module->setDataLayout(target_machine->createDataLayout());
+
+    auto                 file_name = argv[1];
+    std::error_code      err_code;
+    llvm::raw_fd_ostream dest(file_name, err_code, llvm::sys::fs::OF_None);
+
+    if (err_code) {
+        llvm::errs() << "Could not open file: " << err_code.message();
+        return 1;
+    }
+
+    llvm::legacy::PassManager pass;
+    auto                      file_type = llvm::CGFT_ObjectFile;
+    if (target_machine->addPassesToEmitFile(pass, dest, nullptr, file_type)) {
+        llvm::errs() << "TheTargetMachine can't emit a file of this type";
+        return 1;
+    }
+    pass.run(*g_module);
+    dest.flush();
+
+    llvm::outs() << "Wrote " << file_name << "\n";
     return 0;
 }
